@@ -5,6 +5,7 @@
 #include <array>
 #include <fstream>
 #include <chrono>
+#include <string>
 
 // parameters
 const double g = 6.67e-11;
