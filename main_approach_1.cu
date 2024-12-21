@@ -11,7 +11,7 @@
 
 // parameters
 const double G = 6.67e-11;
-const int N_BODIES = 10;
+const int N_BODIES = 1000;
 const int N_DIM = 3;
 // e.g. if N_BODIES > 896 and N_DIM > 9, the gpu breaks becasue of register preassure, other way around is fine
 const double DELTA_T = 1.0;
@@ -46,36 +46,26 @@ double generateRandom(double lower, double upper) {
     return lower + static_cast<double>(std::rand()) / RAND_MAX * (upper - lower);
 }
 
-__device__ double generateLogRandomGpu(double lower, double upper, curandState* state) {
-    double rand_val = curand_uniform(state);  // Generates [0, 1)
-    double result = pow(10.0, log10(lower) + rand_val * (log10(upper) - log10(lower)));
-    return result;
-}
-
-__device__ double generateRandomGpuOld(double lower, double upper, int seed) {
-    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-    double rand_val = seed / 2147483647.0;
-    return lower + rand_val * (upper - lower);
+__device__ double generateRandomGpu(double lower, double upper, curandState* state) {
+    // log scaling for positive ranges
+    if (lower > 0 && upper > 0) {
+        // generates [0, 1)
+        double rand_val = curand_uniform(state);
+        return pow(10.0, log10(lower) + rand_val * (log10(upper) - log10(lower)));
+    } else {
+        // linear scaling for ranges that cross zero
+        // generates [0, 1)
+        double rand_val = curand_uniform(state);
+        rand_val = rand_val * (upper - lower) + lower;
+        return rand_val;
+    }
 }
 
 double generateLogRandom(double lower, double upper) {
     return std::pow(10, std::log10(lower) + static_cast<double>(std::rand()) / RAND_MAX * (std::log10(upper) - std::log10(lower)));
 }
 
-__device__ double generateLogRandomGpuOld(double lower, double upper, int seed) {
-    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-    double rand_val = seed / 2147483647.0;
-    return pow(10.0, log10(lower) + rand_val * (log10(upper) - log10(lower)));
-}
-
-__device__ double generateRandomGpu(double lower, double upper, curandState* state) {
-    double rand_val = curand_uniform(state);  // Generates [0, 1)
-    rand_val *= (upper - lower + 0.999999);   // Scale range
-    rand_val += lower;                        // Offset to lower
-    return truncf(rand_val);                  // Truncate to integer
-}
-
-void initializeMasses(Masses& masses, double lower, double higher) {
+void initializeMasses(Vector& masses, double lower, double higher) {
     for (double& mass : masses) {
         mass = generateLogRandom(lower, higher);
     }
@@ -88,7 +78,7 @@ __global__ void initializeMassesGpu(double* masses, double lower, double higher,
     if (idx >= N_BODIES)
         return;
     
-    masses[idx] = generateLogRandomGpu(lower, higher, &states[idx]);
+    masses[idx] = generateRandomGpu(lower, higher, &states[idx]);
 }
 
 void initializeVectors(Positions& vectors, double lower, double upper) {
@@ -111,6 +101,15 @@ __global__ void initializeVectorsGpu(double* vectors, double lower, double upper
     }
 }
 
+__global__ void initializeCurandStates(curandState* states, unsigned long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= N_BODIES)
+        return;
+
+    curand_init(seed, idx, 0, &states[idx]);
+}
+
 void initializeGpu(Masses& masses, Positions& positions, Positions& velocities) {
     // declare the cuda memory
     double* masses_d;
@@ -126,9 +125,12 @@ void initializeGpu(Masses& masses, Positions& positions, Positions& velocities) 
     int blockSize = (N_BODIES <= MAX_BLOCK_SIZE) ? N_BODIES : MAX_BLOCK_SIZE;
 
     dim3 dimBlock(blockSize);
-	dim3 dimGrid((N_BODIES + blockSize - 1) / blockSize);
+	  dim3 dimGrid((N_BODIES + blockSize - 1) / blockSize);
 
     curandState* states_d;
+    cudaMalloc((void**)&states_d, N_BODIES * sizeof(curandState));
+    initializeCurandStates<<<dimGrid, dimBlock>>>(states_d, time(NULL));
+    cudaDeviceSynchronize();
 
     // execute kernel codes
     initializeMassesGpu<<<dimGrid, dimBlock>>>(masses_d, LOWER_M, HIGHER_M, states_d);
@@ -140,6 +142,11 @@ void initializeGpu(Masses& masses, Positions& positions, Positions& velocities) 
     cudaMemcpy( masses.data(), masses_d, N_BODIES * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy( positions.data(), positions_d, N_BODIES * N_DIM * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy( velocities.data(), velocities_d, N_BODIES * N_DIM * sizeof(double), cudaMemcpyDeviceToHost);
+
+    cudaFree(masses_d);
+    cudaFree(positions_d);
+    cudaFree(velocities_d);
+    cudaFree(states_d);
 }
 
 void computeForces(const Positions& positions, const Masses& masses, Forces& forces) {
@@ -416,6 +423,15 @@ void checkEqual(const auto& first, const auto& second, const std::string& name) 
     }
 }
 
+template <typename Container>
+void printVector(const Container& vec) {
+    std::cout << "{ ";
+    for (const double& val : vec) {
+        std::cout << val << " ";
+    }
+    std::cout << "}" << std::endl;
+}
+
 int main() {
     //std::srand(static_cast<unsigned>(std::time(0)));
 
@@ -425,67 +441,24 @@ int main() {
     Velocities velocities;
 
     // initialization
-    //cpu
-
-    auto start_init = std::chrono::high_resolution_clock::now();
-    initializeMasses(masses, LOWER_M, HIGHER_M);
-    initializeVectors(positions, LOWER_P, HIGHER_P);
-    initializeVectors(velocities, LOWER_V, HIGHER_V);
-    auto end_init = std::chrono::high_resolution_clock::now();
-    auto duration_init = std::chrono::duration_cast<std::chrono::milliseconds>(end_init - start_init);
-    std::cout << "Initialization took " << duration_init.count() << " milliseconds." << std::endl;
-    std::cout << "start: " << std::chrono::duration_cast<std::chrono::milliseconds>(start_init.time_since_epoch()).count() << " end: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_init.time_since_epoch()).count() << std::endl;
-
-    std::cout<<"cpu masses"<<std::endl;
-    for(double& m: masses)
-        std::cout<<m<<std::endl;
-    std::cout<<"cpu positions"<<std::endl;
-    for(double& p: positions)
-        std::cout<<p<<std::endl;
-    std::cout<<"cpu velocities"<<std::endl;
-    for(double& v: velocities)
-        std::cout<<v<<std::endl;
-
-    //gpu
-    
-    auto start_init_gpu = std::chrono::high_resolution_clock::now();
     initializeGpu(masses, positions, velocities);
-    auto end_init_gpu = std::chrono::high_resolution_clock::now();
-    auto duration_init_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(end_init - start_init);
-    std::cout << "Initialization took " << duration_init_gpu.count() << " milliseconds." << std::endl;
-    std::cout << "start: " << std::chrono::duration_cast<std::chrono::milliseconds>(start_init_gpu.time_since_epoch()).count() << " end: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_init_gpu.time_since_epoch()).count() << std::endl;
-    
-    std::cout<<"gpu masses"<<std::endl;
-    for(double& m1: masses)
-        for(double& m: m1)
-        std::cout<<m<<std::endl;
-    std::cout<<"gpu positions"<<std::endl;
-    for(auto& p1: positions)
-        for(double& p: p1)
-        std::cout<<p<<std::endl;
-    std::cout<<"gpu velocities"<<std::endl;
-    for(double& v1: velocities)
-        for(double& v: v1)
-        std::cout<<v<<std::endl;
-    
-    // cpu simulation run
 
+    // cpu simulation run
     Positions positions_cpu = positions;
 
     auto start_cpu = std::chrono::high_resolution_clock::now();
 
-    //runSimulationCpu(masses, positions_cpu, velocities);
+    runSimulationCpu(masses, positions_cpu, velocities);
 
     auto end_cpu = std::chrono::high_resolution_clock::now();
     auto duration_cpu = std::chrono::duration_cast<std::chrono::milliseconds>(end_cpu - start_cpu);
 
     // gpu simulation run
-
     Positions positions_gpu = positions;
 
     auto start_gpu = std::chrono::high_resolution_clock::now();
 
-    //runSimulationGpu(masses, positions_gpu, velocities);
+    runSimulationGpu(masses, positions_gpu, velocities);
     
     auto end_gpu = std::chrono::high_resolution_clock::now();
     auto duration_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(end_gpu - start_gpu);
